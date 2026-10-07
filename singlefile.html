@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CARRION — WebAssembly</title>
+  <link rel="icon" type="image/x-icon" href="https://cdn.jsdelivr.net/gh/AgentCube/carrion-wasm@main/favicon.ico">
+  
+  <style>
+    *, *::before, *::after {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+    html, body {
+      width: 100%;
+      height: 100%;
+      background: #000000;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      font-family: monospace;
+      color: #ffffff;
+      overflow: hidden;
+    }
+    #canvas-wrapper {
+      position: relative;
+      width: min(100vw, calc(100vh * 16 / 9));
+      aspect-ratio: 16 / 9;
+      background: #000000;
+    }
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+      image-rendering: pixelated;
+      image-rendering: crisp-edges;
+      cursor: crosshair;
+      user-select: none;
+      -webkit-user-select: none;
+      touch-action: none;
+    }
+    #loading-overlay {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      background: #000000;
+      color: #ffffff;
+      font-family: monospace;
+      z-index: 100;
+    }
+    #loading-overlay.hidden {
+      display: none !important;
+      pointer-events: none !important;
+    }
+    #loading-box {
+      text-align: center;
+      max-width: 600px;
+      padding: 20px;
+    }
+    #loading-title {
+      font-size: 24px;
+      font-weight: bold;
+      letter-spacing: 0.1em;
+      margin-bottom: 20px;
+      color: #ffffff;
+    }
+    #loading-progress {
+      font-size: 14px;
+      color: #ffffff;
+      min-height: 1.5em;
+    }
+    .loading-notice {
+      color: #e0af68;
+      margin-top: 15px;
+      font-size: 13px;
+      line-height: 1.4;
+    }
+    #fps-counter {
+      position: fixed;
+      top: 10px;
+      right: 12px;
+      background: rgba(0, 0, 0, 0.75);
+      color: #4ade80;
+      font-family: monospace, Consolas, Courier, sans-serif;
+      font-size: 13px;
+      font-weight: bold;
+      padding: 4px 10px;
+      border-radius: 4px;
+      border: 1px solid rgba(74, 222, 128, 0.35);
+      pointer-events: none;
+      z-index: 9999;
+    }
+  </style>
+
+  <script src="https://cdn.jsdelivr.net/gh/AgentCube/carrion-wasm@main/coi-serviceworker.min.js"></script>
+</head>
+<body>
+  <div id="canvas-wrapper">
+    <canvas id="canvas" oncontextmenu="event.preventDefault()" tabindex="-1"></canvas>
+    <div id="fps-counter">-- FPS</div>
+    <div id="loading-overlay">
+      <div id="loading-box">
+        <div id="loading-title">CARRION (WASM)</div>
+        <div id="loading-progress">Initializing runtime...</div>
+        <div class="loading-notice">Note: Music is turned off for smoother performance.</div>
+      </div>
+    </div>
+  </div>
+
+  <script type="module">
+    const CDN_BASE = "https://cdn.jsdelivr.net/gh/AgentCube/carrion-wasm@main/";
+    const RAW_BASE = "https://raw.githubusercontent.com/AgentCube/carrion-wasm/main/";
+
+    async function fetchAsset(relativePath, isJson = false) {
+      const cleanPath = relativePath.startsWith('/') ? relativePath.slice(1) : relativePath;
+      let res = await fetch(RAW_BASE + cleanPath);
+      if (!res.ok) {
+        res = await fetch(CDN_BASE + cleanPath);
+      }
+      if (!res.ok) throw new Error(`Could not load ${cleanPath} (HTTP ${res.status})`);
+      return isJson ? await res.json() : await res.arrayBuffer();
+    }
+
+    const canvas = document.getElementById("canvas");
+    const progressEl = document.getElementById("loading-progress");
+    const overlayEl = document.getElementById("loading-overlay");
+
+    if (canvas) {
+      canvas.width = 1280;
+      canvas.height = 720;
+      canvas.addEventListener("click", () => {
+        if (canvas.requestPointerLock && document.pointerLockElement !== canvas) {
+          canvas.requestPointerLock();
+        }
+      });
+    }
+
+    function setStatus(msg) {
+      console.log("[Carrion.Web] " + msg);
+      if (progressEl) progressEl.textContent = msg;
+    }
+
+    setStatus("Initializing .NET WebAssembly runtime...");
+
+    globalThis.Module = globalThis.Module || {};
+    if (canvas) globalThis.Module.canvas = canvas;
+
+    const activeAudioContexts = new Set();
+    const OrigAudioContext = window.AudioContext || window.webkitAudioContext;
+    if (OrigAudioContext) {
+      const WrappedAudioContext = function(...args) {
+        let opts = args[0] || {};
+        if (!opts.sampleRate) opts.sampleRate = 48000;
+        const ctx = new OrigAudioContext(opts);
+        activeAudioContexts.add(ctx);
+        return ctx;
+      };
+      WrappedAudioContext.prototype = OrigAudioContext.prototype;
+      window.AudioContext = WrappedAudioContext;
+      if (window.webkitAudioContext) window.webkitAudioContext = WrappedAudioContext;
+    }
+
+    function resumeAllAudio() {
+      for (const ctx of activeAudioContexts) {
+        if (ctx.state === 'suspended') ctx.resume().catch(() => {});
+      }
+      const sdl2 = globalThis.Module?.SDL2 || globalThis.SDL2 || window.SDL2;
+      if (sdl2?.audioContext && sdl2.audioContext.state === 'suspended') {
+        sdl2.audioContext.resume().catch(() => {});
+      }
+    }
+
+    const unlockAudio = () => resumeAllAudio();
+    ['click', 'keydown', 'mousedown', 'pointerdown', 'touchstart'].forEach(evt => {
+      window.addEventListener(evt, unlockAudio, { capture: true, passive: true, once: true });
+    });
+
+    let virtualMouseX = 320;
+    let virtualMouseY = 180;
+    window.addEventListener('mousemove', (e) => {
+      if (document.pointerLockElement) {
+        virtualMouseX = Math.max(0, Math.min(640, virtualMouseX + e.movementX));
+        virtualMouseY = Math.max(0, Math.min(360, virtualMouseY + e.movementY));
+      } else {
+        const rect = canvas?.getBoundingClientRect();
+        if (rect && rect.width > 0 && rect.height > 0) {
+          virtualMouseX = Math.max(0, Math.min(640, ((e.clientX - rect.left) / rect.width) * 640));
+          virtualMouseY = Math.max(0, Math.min(360, ((e.clientY - rect.top) / rect.height) * 360));
+        }
+      }
+    }, { passive: true });
+
+    const fpsEl = document.getElementById("fps-counter");
+    let lastFpsTime = performance.now();
+    let fpsFrames = 0;
+    setInterval(() => {
+      const now = performance.now();
+      const elapsed = now - lastFpsTime;
+      if (elapsed >= 500) {
+        const currentFps = Math.min(60, Math.round((fpsFrames * 1000) / elapsed));
+        if (fpsEl) fpsEl.textContent = `${currentFps} FPS`;
+        fpsFrames = 0;
+        lastFpsTime = now;
+      }
+    }, 500);
+
+    function ensureDirectoryExists(fs, dirPath) {
+      if (!dirPath || dirPath === '/' || dirPath === '.') return;
+      const parts = dirPath.split('/').filter(p => p.length > 0);
+      let current = '';
+      for (const part of parts) {
+        current += '/' + part;
+        try {
+          if (!fs.analyzePath(current).exists) fs.mkdir(current);
+        } catch (_) {}
+      }
+    }
+
+    async function mountSave(FS) {
+      if (!FS) return;
+      ensureDirectoryExists(FS, "/save");
+      ensureDirectoryExists(FS, "/save/Phobia/Carrion");
+      if (typeof FS.mount === 'function' && FS.filesystems?.IDBFS) {
+        try {
+          FS.mount(FS.filesystems.IDBFS, {}, "/save");
+          await new Promise((resolve) => FS.syncfs(true, () => resolve()));
+          window.syncSaveData = () => FS.syncfs(false, () => {});
+          window.addEventListener('beforeunload', () => window.syncSaveData());
+        } catch (_) {}
+      }
+    }
+
+    async function preloadContent(FS) {
+      if (!FS) return;
+      setStatus("Loading game archives...");
+      
+      let manifest;
+      try {
+        manifest = await fetchAsset("assets/content.pack.manifest.json", true);
+      } catch (_) {
+        manifest = { parts: ["content.pack.00", "content.pack.01", "content.pack.02", "content.pack.03"] };
+      }
+
+      const parts = manifest.parts;
+      let loaded = 0;
+      const partBuffers = await Promise.all(parts.map(async (part) => {
+        const buf = await fetchAsset("assets/" + part, false);
+        loaded++;
+        setStatus(`Downloading game archives (${loaded}/${parts.length})...`);
+        return buf;
+      }));
+
+      setStatus("Extracting assets into MEMFS...");
+      const fullBuffer = await new Blob(partBuffers).arrayBuffer();
+      const view = new DataView(fullBuffer);
+      const entryCount = view.getUint32(4, true);
+
+      let offset = 8;
+      const entries = [];
+      const decoder = new TextDecoder('utf-8');
+
+      for (let i = 0; i < entryCount; i++) {
+        const pathLen = view.getUint16(offset, true);
+        offset += 2;
+        const relPath = decoder.decode(new Uint8Array(fullBuffer, offset, pathLen));
+        offset += pathLen;
+        const dataOffset = view.getUint32(offset, true);
+        offset += 4;
+        const dataLen = view.getUint32(offset, true);
+        offset += 4;
+        entries.push({ path: relPath, dataOffset, dataLen });
+      }
+
+      const payloadStart = offset;
+      for (let i = 0; i < entries.length; i++) {
+        const entry = entries[i];
+        const bytes = new Uint8Array(fullBuffer, payloadStart + entry.dataOffset, entry.dataLen);
+        const virtPath = "/Content/" + entry.path;
+        const dir = virtPath.substring(0, virtPath.lastIndexOf('/'));
+        if (dir) ensureDirectoryExists(FS, dir);
+        FS.writeFile(virtPath, bytes);
+      }
+      console.log(`[Carrion.Web] Mounted ${entryCount} assets.`);
+    }
+
+    async function boot() {
+      try {
+        setStatus("Fetching runtime boot manifest...");
+        const bootConfig = await fetchAsset("_framework/blazor.boot.json", true);
+
+        const dotnetModule = await import(`${CDN_BASE}_framework/dotnet.js`);
+        const dotnet = dotnetModule.dotnet;
+
+        const runtime = await dotnet
+          .withEnvironmentVariable("FNA_PLATFORM_BACKEND", "SDL2")
+          .withEnvironmentVariable("XDG_DATA_HOME", "/save")
+          .withEnvironmentVariable("FNA_GAMEPAD_NUM_GAMEPADS", "16")
+          .withDiagnosticTracing(false)
+          .withConfig(bootConfig)
+          .withResourceLoader((type, name, defaultUri) => {
+            if (defaultUri && defaultUri.startsWith("http")) return defaultUri;
+            return `${CDN_BASE}_framework/${name}`;
+          })
+          .withModuleConfig({ canvas })
+          .create();
+
+        if (runtime.Module && canvas) runtime.Module.canvas = canvas;
+
+        if (typeof runtime.setModuleImports === 'function') {
+          runtime.setModuleImports('main.js', {
+            setMainLoop: (cb) => {
+              const TARGET_FPS = 60;
+              const FRAME_INTERVAL = 1000 / TARGET_FPS;
+              let lastFrameTime = performance.now();
+              function step(now) {
+                requestAnimationFrame(step);
+                const elapsed = now - lastFrameTime;
+                if (elapsed < FRAME_INTERVAL - 1.5) return;
+                lastFrameTime = now - (elapsed % FRAME_INTERVAL);
+                try { cb(); } catch (e) { console.error(e); }
+                fpsFrames++;
+              }
+              requestAnimationFrame(step);
+            },
+            notifyGameReady: () => {
+              const overlay = document.getElementById("loading-overlay");
+              if (overlay) {
+                overlay.classList.add("hidden");
+                overlay.style.display = "none";
+              }
+            },
+            playAudioEvent: () => {},
+            stopAudioEvent: () => {},
+            triggerSyncSave: () => { if (window.syncSaveData) window.syncSaveData(); },
+            getVirtualMouseX: () => Math.round(virtualMouseX),
+            getVirtualMouseY: () => Math.round(virtualMouseY)
+          });
+        }
+
+        const FS = runtime.Module?.FS || runtime.FS || globalThis.Module?.FS;
+        await mountSave(FS);
+        await preloadContent(FS);
+
+        setStatus("Starting Carrion engine...");
+        await dotnet.run();
+      } catch (err) {
+        console.error(err);
+        setStatus("Fatal Error: " + (err.message || err));
+      }
+    }
+
+    boot();
+  </script>
+</body>
+</html>
